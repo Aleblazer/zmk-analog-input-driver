@@ -33,6 +33,9 @@ struct analog_input_data {
     uint16_t *as_buff;
     int32_t *delta;
     int32_t *prev;
+    int32_t *anchor;    // settle-mode: band centre for the idle decision
+    uint16_t *still;    // settle-mode: consecutive in-band samples
+    bool *idle_ch;      // settle-mode: per-channel quiet state
     struct k_work_delayable init_work;
     int async_init_step;
     bool ready;
@@ -54,6 +57,7 @@ struct analog_input_io_channel {
     bool invert;
     bool report_on_change_only;
     uint16_t report_threshold;
+    uint16_t report_settle_samples;
     uint16_t scale_multiplier;
     uint16_t scale_divisor;
     uint8_t evt_type;

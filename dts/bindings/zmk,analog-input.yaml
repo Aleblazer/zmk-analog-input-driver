@@ -33,11 +33,28 @@ child-binding:
       type: int
       default: 0
       description: |
-        With report-on-change-only, suppress a report unless the (scaled) value
-        differs from the last reported value by at least this many units. 0 keeps
-        the original "report on any change" behaviour. A small threshold lets a
-        noisy analog source (e.g. a slide pot) sit quiet at rest so the device can
-        idle into deep sleep, while still reporting real movement.
+        Deadband, in scaled units, for report-on-change-only.
+
+        With report-settle-samples = 0 (default): a plain magnitude deadband -
+        suppress a report unless the value moved at least this far from the last
+        reported value. Simple, but quantizes movement by this amount.
+
+        With report-settle-samples > 0: "settle mode". This value is instead the
+        rest/wake band used only to decide idle vs. moving - reporting itself
+        stays full-resolution while moving. Lets a noisy analog source (e.g. a
+        slide pot) go quiet at rest so the device can deep-sleep, without losing
+        resolution at compressed ends of travel.
+
+        0 keeps the original "report on any change" behaviour.
+    report-settle-samples:
+      type: int
+      default: 0
+      description: |
+        Enables settle mode (needs report-threshold > 0). Once the value has
+        stayed within report-threshold of its anchor for this many consecutive
+        samples, stop reporting (idle) so the device can deep-sleep. Any move
+        beyond the band wakes it and resumes full-resolution reporting. Roughly
+        settle-seconds * sampling-hz. 0 disables settle mode.
     scale-multiplier:
       type: int
       default: 1

@@ -18,12 +18,22 @@ LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
 
 #include <zmk/drivers/analog_input.h>
 
-/* Report when the value differs from the last reported one by at least the
- * configured threshold; threshold 0 keeps the original "report on any change". */
+/* Plain magnitude deadband: report when the value differs from the last reported
+ * one by at least the threshold; threshold 0 = report on any change. */
 static inline bool analog_input_changed(int32_t dv, int32_t pv, uint16_t threshold) {
     int32_t d = dv - pv;
     if (d < 0) d = -d;
     return threshold ? (d >= (int32_t)threshold) : (dv != pv);
+}
+
+/* Whether channel <c> should emit, given current value <dv> and last reported
+ * <pv>. In settle mode (threshold + settle-samples) the idle gating already
+ * forces dv==pv when quiet, so reporting is full-resolution "any change";
+ * otherwise fall back to the plain magnitude deadband. */
+static inline bool analog_input_should_report(const struct analog_input_io_channel *c,
+                                              int32_t dv, int32_t pv) {
+    if (c->report_threshold && c->report_settle_samples) return dv != pv;
+    return analog_input_changed(dv, pv, c->report_threshold);
 }
 
 static int analog_input_report_data(const struct device *dev) {
@@ -100,8 +110,27 @@ static int analog_input_report_data(const struct device *dev) {
         v = (int16_t)((v * ch_cfg.scale_multiplier) / ch_cfg.scale_divisor);
 
         if (ch_cfg.report_on_change_only) {
-            // track raw value to compare until next report interval
-            data->delta[i] = v;
+            if (ch_cfg.report_threshold && ch_cfg.report_settle_samples) {
+                // Settle mode: report every change while moving (full resolution
+                // everywhere, including compressed ends), but go quiet once the
+                // value has stayed within report_threshold of its anchor for
+                // report_settle_samples in a row, so a noisy source can deep-sleep.
+                // Any move beyond the band re-anchors and wakes it.
+                int32_t dev = v - data->anchor[i];
+                if (dev < 0) dev = -dev;
+                if (dev >= (int32_t)ch_cfg.report_threshold) {
+                    data->anchor[i] = v;
+                    data->still[i] = 0;
+                    data->idle_ch[i] = false;
+                } else if (!data->idle_ch[i] && ++data->still[i] >= ch_cfg.report_settle_samples) {
+                    data->idle_ch[i] = true;
+                }
+                // While idle, hold delta == prev so nothing is emitted.
+                data->delta[i] = data->idle_ch[i] ? data->prev[i] : v;
+            } else {
+                // track value to compare until next report interval
+                data->delta[i] = v;
+            }
         }
         else {
             // accumulate delta until report in next iteration
@@ -139,7 +168,7 @@ static int analog_input_report_data(const struct device *dev) {
     int8_t idx_to_sync = -1;
     for (int i = config->io_channels_len - 1; i >= 0; i--) {
         struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
-        if (analog_input_changed(data->delta[i], data->prev[i], ch_cfg.report_threshold)) {
+        if (analog_input_should_report(&ch_cfg, data->delta[i], data->prev[i])) {
             idx_to_sync = i;
             break;
         }
@@ -150,7 +179,7 @@ static int analog_input_report_data(const struct device *dev) {
         // LOG_DBG("AIN%u get delta AGAIN", i);
         int32_t dv = data->delta[i];
         int32_t pv = data->prev[i];
-        if (analog_input_changed(dv, pv, ch_cfg.report_threshold)) {
+        if (analog_input_should_report(&ch_cfg, dv, pv)) {
 #if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
             last_rpt_time = now;
 #endif
@@ -295,6 +324,13 @@ static void analog_input_async_init(struct k_work *work) {
     uint16_t prev_size = config->io_channels_len * sizeof(int32_t);
     data->prev = malloc(prev_size);
     memset(data->prev, 0, prev_size);
+
+    data->anchor = malloc(config->io_channels_len * sizeof(int32_t));
+    memset(data->anchor, 0, config->io_channels_len * sizeof(int32_t));
+    data->still = malloc(config->io_channels_len * sizeof(uint16_t));
+    memset(data->still, 0, config->io_channels_len * sizeof(uint16_t));
+    data->idle_ch = malloc(config->io_channels_len * sizeof(bool));
+    memset(data->idle_ch, 0, config->io_channels_len * sizeof(bool));
 
 #if CONFIG_ANALOG_INPUT_ADC_RES > 16
     uint16_t buff_size = config->io_channels_len * sizeof(uint32_t);
@@ -449,6 +485,7 @@ static const struct sensor_driver_api analog_input_driver_api = {
         .invert = DT_PROP(node_id, invert),                                                        \
         .report_on_change_only = DT_PROP(node_id, report_on_change_only),                          \
         .report_threshold = DT_PROP(node_id, report_threshold),                                    \
+        .report_settle_samples = DT_PROP(node_id, report_settle_samples),                          \
         .scale_multiplier = DT_PROP(node_id, scale_multiplier),                                    \
         .scale_divisor = DT_PROP(node_id, scale_divisor),                                          \
         .evt_type = DT_PROP(node_id, evt_type),                                                    \
