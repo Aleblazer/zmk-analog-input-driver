@@ -29,6 +29,15 @@ child-binding:
       type: boolean
     report-on-change-only:
       type: boolean
+    report-threshold:
+      type: int
+      default: 0
+      description: |
+        With report-on-change-only, suppress a report unless the (scaled) value
+        differs from the last reported value by at least this many units. 0 keeps
+        the original "report on any change" behaviour. A small threshold lets a
+        noisy analog source (e.g. a slide pot) sit quiet at rest so the device can
+        idle into deep sleep, while still reporting real movement.
     scale-multiplier:
       type: int
       default: 1

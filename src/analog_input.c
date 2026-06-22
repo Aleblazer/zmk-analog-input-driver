@@ -18,6 +18,14 @@ LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
 
 #include <zmk/drivers/analog_input.h>
 
+/* Report when the value differs from the last reported one by at least the
+ * configured threshold; threshold 0 keeps the original "report on any change". */
+static inline bool analog_input_changed(int32_t dv, int32_t pv, uint16_t threshold) {
+    int32_t d = dv - pv;
+    if (d < 0) d = -d;
+    return threshold ? (d >= (int32_t)threshold) : (dv != pv);
+}
+
 static int analog_input_report_data(const struct device *dev) {
     struct analog_input_data *data = dev->data;
     const struct analog_input_config *config = dev->config;
@@ -129,10 +137,9 @@ static int analog_input_report_data(const struct device *dev) {
     }
 
     int8_t idx_to_sync = -1;
-    for (uint8_t i = config->io_channels_len - 1; i >= 0; i--) {
-        int32_t dv = data->delta[i];
-        int32_t pv = data->prev[i];
-        if (dv != pv) {
+    for (int i = config->io_channels_len - 1; i >= 0; i--) {
+        struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
+        if (analog_input_changed(data->delta[i], data->prev[i], ch_cfg.report_threshold)) {
             idx_to_sync = i;
             break;
         }
@@ -143,7 +150,7 @@ static int analog_input_report_data(const struct device *dev) {
         // LOG_DBG("AIN%u get delta AGAIN", i);
         int32_t dv = data->delta[i];
         int32_t pv = data->prev[i];
-        if (dv != pv) {
+        if (analog_input_changed(dv, pv, ch_cfg.report_threshold)) {
 #if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
             last_rpt_time = now;
 #endif
@@ -441,6 +448,7 @@ static const struct sensor_driver_api analog_input_driver_api = {
         .mv_deadzone = DT_PROP(node_id, mv_deadzone),                                              \
         .invert = DT_PROP(node_id, invert),                                                        \
         .report_on_change_only = DT_PROP(node_id, report_on_change_only),                          \
+        .report_threshold = DT_PROP(node_id, report_threshold),                                    \
         .scale_multiplier = DT_PROP(node_id, scale_multiplier),                                    \
         .scale_divisor = DT_PROP(node_id, scale_divisor),                                          \
         .evt_type = DT_PROP(node_id, evt_type),                                                    \

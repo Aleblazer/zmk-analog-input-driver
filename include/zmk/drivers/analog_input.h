@@ -53,6 +53,7 @@ struct analog_input_io_channel {
     uint8_t mv_deadzone;
     bool invert;
     bool report_on_change_only;
+    uint16_t report_threshold;
     uint16_t scale_multiplier;
     uint16_t scale_divisor;
     uint8_t evt_type;
