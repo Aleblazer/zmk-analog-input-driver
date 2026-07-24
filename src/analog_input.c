@@ -36,6 +36,87 @@ static inline bool analog_input_should_report(const struct analog_input_io_chann
     return analog_input_changed(dv, pv, c->report_threshold);
 }
 
+/*
+ * Take one ADC sequence, gating the sensor's excitation rail around it.
+ *
+ * With power-gpios set (a MOSFET switching the top leg of a resistive divider)
+ * the divider only burns current while we are actually sampling: assert the
+ * gate, wait power-settle-us for the wiper's RC to settle, convert, release.
+ * A 10k slide pot across 3V3 draws ~330uA continuously; at 10 Hz with a ~3 ms
+ * on-time that becomes ~10uA average, which is what makes it viable on a
+ * wireless half. No-op when power-gpios is absent (always-on divider).
+ *
+ * The rail is released on every path out, including read errors.
+ */
+static int analog_input_acquire(const struct device *dev) {
+    struct analog_input_data *data = dev->data;
+    const struct analog_input_config *config = dev->config;
+    const struct device *adc = config->io_channels[0].adc_channel.dev;
+    int err;
+
+    if (data->power_ready) {
+        err = gpio_pin_set_dt(&config->power_gpio, 1);
+        if (err < 0) {
+            LOG_ERR("excitation gate on returned %d", err);
+            return err;
+        }
+        if (config->power_settle_us) {
+            k_sleep(K_USEC(config->power_settle_us));
+        }
+    }
+
+#ifdef CONFIG_ADC_ASYNC
+    err = adc_read_async(adc, &data->as, &data->async_sig);
+    if (err == 0) {
+        err = k_poll(&data->async_evt, 1, K_FOREVER);
+        if (err == 0) {
+            if (data->async_evt.signal->signaled) {
+                data->async_evt.signal->signaled = 0;
+                data->async_evt.state = K_POLL_STATE_NOT_READY;
+            } else {
+                err = -EAGAIN;
+            }
+        } else {
+            LOG_ERR("k_poll returned %d", err);
+        }
+    } else {
+        LOG_ERR("read_async returned %d", err);
+    }
+#else
+    err = adc_read(adc, &data->as);
+    if (err < 0) {
+        LOG_ERR("read returned %d", err);
+    }
+#endif
+
+    if (data->power_ready) {
+        int perr = gpio_pin_set_dt(&config->power_gpio, 0);
+        if (perr < 0) {
+            LOG_ERR("excitation gate off returned %d", perr);
+        }
+    }
+
+    return err;
+}
+
+/*
+ * Retime the sampling timer. Used to drop to idle-sampling-hz once every
+ * settle-mode channel has gone quiet, and to snap back to the full rate the
+ * moment anything moves. The sample rate is the dominant battery cost when
+ * the excitation rail is gated, but it is also what the fader's responsiveness
+ * on first touch depends on.
+ */
+static void analog_input_apply_rate(const struct device *dev, uint32_t hz) {
+    struct analog_input_data *data = dev->data;
+
+    if (!hz || !data->enabled || data->cur_hz == hz) {
+        return;
+    }
+    data->cur_hz = hz;
+    uint32_t usec = 1000000UL / hz;
+    k_timer_start(&data->sampling_timer, K_USEC(usec), K_USEC(usec));
+}
+
 static int analog_input_report_data(const struct device *dev) {
     struct analog_input_data *data = dev->data;
     const struct analog_input_config *config = dev->config;
@@ -58,34 +139,41 @@ static int analog_input_report_data(const struct device *dev) {
         const struct device* adc = ch_cfg.adc_channel.dev;
 
         if (i == 0) {
-#ifdef CONFIG_ADC_ASYNC
-            int err = adc_read_async(adc, as, &data->async_sig);
-            if (err < 0) {
-                LOG_ERR("AIN%u read_async returned %d", i, err);
-                return err;
-            }
-            err = k_poll(&data->async_evt, 1, K_FOREVER);
-            if (err < 0) {
-                LOG_ERR("AIN%u k_poll returned %d", i, err);
-                return err;
-            }
-            if (!data->async_evt.signal->signaled) {
+            int err = analog_input_acquire(dev);
+            if (err == -EAGAIN) {
                 return 0;
             }
-            data->async_evt.signal->signaled = 0;
-    	    data->async_evt.state = K_POLL_STATE_NOT_READY;
-#else
-            int err = adc_read(adc, as);
             if (err < 0) {
-                LOG_ERR("AIN%u read returned %d", i, err);
                 return err;
             }
-#endif
         }
 
-        int32_t raw = data->as_buff[i];
+        /*
+         * Single-ended readings sit just above 0 V at the bottom of travel, so
+         * a noisy sample can come back slightly negative. as_buff is unsigned,
+         * which would turn -1 into 65535 and flip the fader to full scale, so
+         * reinterpret as signed and floor at zero. (Only sound while the
+         * resolution leaves the sign bit free, which every supported width
+         * here does.)
+         */
+        int32_t raw = (int16_t)data->as_buff[i];
+        if (raw < 0) {
+            raw = 0;
+        }
         int32_t mv = raw;
-        adc_raw_to_millivolts(adc_ref_internal(adc), ADC_GAIN_1_6, as->resolution, &mv);
+        /*
+         * Scale with the channel's own gain rather than a fixed one: an
+         * off-chip ADC (e.g. ADS1115, ref 2048 mV at gain 1/2) has a completely
+         * different full scale from the nRF SAADC (600 mV at gain 1/6), and
+         * hardcoding the latter misreads every other controller. Falls back to
+         * the historical constant when channel config isn't taken from DT.
+         */
+#if IS_ENABLED(CONFIG_ANALOG_INPUT_USE_DTS_ADC_CH_CFG)
+        enum adc_gain gain = ch_cfg.adc_channel.channel_cfg.gain;
+#else
+        enum adc_gain gain = ADC_GAIN_1_6;
+#endif
+        adc_raw_to_millivolts(adc_ref_internal(adc), gain, as->resolution, &mv);
 #if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)
         LOG_DBG("AIN%u raw: %d mv: %d", ch_cfg.adc_channel.channel_id, raw, mv);
 #endif
@@ -142,6 +230,31 @@ static int analog_input_report_data(const struct device *dev) {
 
     // First read is setup as calibration
     as->calibrate = false;
+
+    /*
+     * Once every settle-mode channel has gone quiet there is nothing to track
+     * until the user touches the control again, so sample far more slowly. The
+     * cost of the slow rate is first-touch latency (one idle period before the
+     * move is noticed), which is why this is separate from report-settle-samples.
+     */
+    if (config->idle_sampling_hz) {
+        bool any_settle_ch = false;
+        bool all_idle = true;
+        for (uint8_t i = 0; i < config->io_channels_len; i++) {
+            const struct analog_input_io_channel *c = &config->io_channels[i];
+            if (!c->report_on_change_only || !c->report_threshold || !c->report_settle_samples) {
+                continue;
+            }
+            any_settle_ch = true;
+            if (!data->idle_ch[i]) {
+                all_idle = false;
+                break;
+            }
+        }
+        if (any_settle_ch) {
+            analog_input_apply_rate(dev, all_idle ? config->idle_sampling_hz : data->sampling_hz);
+        }
+    }
 
 #if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
     // purge accumulated delta, if last sampled had not been reported on last report tick
@@ -210,8 +323,14 @@ static void sampling_work_handler(struct k_work *work) {
 static void sampling_timer_handler(struct k_timer *timer) {
     struct analog_input_data *data = CONTAINER_OF(timer, struct analog_input_data, sampling_timer);
     // LOG_DBG("sampling timer triggered");
+    /*
+     * Private queue only. This used to also submit to the system workqueue,
+     * which was merely redundant when a sample was a few microseconds of SAADC;
+     * with an off-chip ADC a sample blocks for milliseconds (settle delay plus
+     * I2C conversion), and stalling ZMK's system workqueue that long would hold
+     * up BLE and HID work.
+     */
     k_work_submit_to_queue(&analog_input_work_q, &data->sampling_work);
-    k_work_submit(&data->sampling_work);
 }
 
 static int active_set_value(const struct device *dev, bool active) {
@@ -261,10 +380,12 @@ static int enable_set_value(const struct device *dev, bool enable) {
         } else {
             k_timer_start(&data->sampling_timer, K_NO_WAIT, K_NO_WAIT);
         }
+        data->cur_hz = data->sampling_hz;
         data->enabled = true;
     }
     else {
         k_timer_stop(&data->sampling_timer);
+        data->cur_hz = 0;
         data->enabled = false;
     }
 
@@ -314,6 +435,24 @@ static void analog_input_async_init(struct k_work *work) {
         int err = adc_channel_setup(adc, &channel_cfg);
         if (err < 0) {
             LOG_ERR("AIN%u setup returned %d", i, err);
+        }
+    }
+
+    /*
+     * Excitation gate, if the board has one. Configured inactive so the divider
+     * stays unpowered between samples; the active level (a P-FET high-side
+     * switch is active low) comes from the GPIO flags in devicetree.
+     */
+    if (config->power_gpio.port) {
+        if (!gpio_is_ready_dt(&config->power_gpio)) {
+            LOG_ERR("excitation gate %s is not ready", config->power_gpio.port->name);
+        } else {
+            int err = gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
+            if (err < 0) {
+                LOG_ERR("excitation gate configure returned %d", err);
+            } else {
+                data->power_ready = true;
+            }
         }
     }
 
@@ -499,6 +638,9 @@ static const struct sensor_driver_api analog_input_driver_api = {
     };                                                                                             \
     static const struct analog_input_config config##n = {                                          \
         .sampling_hz = DT_PROP(DT_DRV_INST(n), sampling_hz),                                       \
+        .idle_sampling_hz = DT_PROP(DT_DRV_INST(n), idle_sampling_hz),                             \
+        .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
+        .power_settle_us = DT_PROP(DT_DRV_INST(n), power_settle_us),                               \
         .io_channels_len = (DT_FOREACH_CHILD(DT_DRV_INST(n), ANIN_IOC_CHILD_LEN_PLUS_ONE) 0),      \
         .io_channels = { DT_INST_FOREACH_CHILD_SEP(n, TRANSFORMED_IO_CHANNEL_ENTRY, (, )) },       \
     };                                                                                             \

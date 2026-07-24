@@ -41,6 +41,8 @@ struct analog_input_data {
     bool ready;
 
     uint32_t sampling_hz;
+    uint32_t cur_hz;    // rate the timer is actually running at (see idle_sampling_hz)
+    bool power_ready;   // excitation gate configured and usable
     bool enabled;
     bool actived;
 
@@ -66,6 +68,9 @@ struct analog_input_io_channel {
 
 struct analog_input_config {
     uint32_t sampling_hz;
+    uint32_t idle_sampling_hz;      // 0 = never slow down
+    struct gpio_dt_spec power_gpio; // excitation gate; .port == NULL when absent
+    uint32_t power_settle_us;
     uint8_t io_channels_len;
 	struct analog_input_io_channel io_channels[];
 };

@@ -9,6 +9,40 @@ properties:
   sampling-hz:
     type: int
     default: 100
+  idle-sampling-hz:
+    type: int
+    default: 0
+    description: |
+      Reduced sample rate used once every settle-mode channel has gone quiet
+      (needs report-threshold + report-settle-samples on those channels). Any
+      movement snaps straight back to sampling-hz.
+
+      On a battery-powered device with power-gpios this is the dominant knob:
+      current scales with the sample rate, because each sample powers the
+      divider for power-settle-us plus one conversion. The cost is first-touch
+      latency - up to one idle period passes before movement is noticed - so
+      trade it off against how responsive the control has to feel.
+
+      0 disables the reduction and always samples at sampling-hz.
+  power-gpios:
+    type: phandle-array
+    description: |
+      Optional GPIO gating the sensor's excitation rail, e.g. a MOSFET on the
+      top leg of a resistive divider. Driven active only while sampling, so a
+      divider that would otherwise draw current continuously (a 10k pot across
+      3.3 V is ~330 uA) costs only its sampling duty cycle.
+
+      Use the standard GPIO flags for polarity - a P-channel high-side switch
+      is GPIO_ACTIVE_LOW. Omit for directly-powered sensors.
+  power-settle-us:
+    type: int
+    default: 0
+    description: |
+      Microseconds to wait after asserting power-gpios before converting, to let
+      the divider output and any anti-alias RC settle. Budget about 5 time
+      constants: a 10k pot (2.5k worst-case source impedance) feeding a 100R +
+      0.1uF filter is tau ~= 260 us, so ~1500-2000 us. Too short reads low and
+      lags the true position; too long just wastes battery.
 
 child-binding:
   description: Per-channel configuration settings
